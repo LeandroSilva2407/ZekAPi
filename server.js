@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_REMETENTE = process.env.EMAIL_REMETENTE || "$Zek <admin@zek.tec.br>";
 
 const SITE_URL = process.env.SITE_URL;
 const API_URL = process.env.API_URL;
@@ -28,6 +29,7 @@ const resend = RESEND_API_KEY
 // Depois substituiremos por banco.
 const pedidos = new Map();
 const emailsEnviados = new Set();
+const emailsEmAndamento = new Set();
 
 
 // ======================================================
@@ -221,14 +223,22 @@ app.post("/api/webhook", async (req, res) => {
 
     try {
 
-        const paymentId =
-            req.body?.data?.id ||
-            req.query["data.id"];
+        // Notificações de outros recursos não são pagamentos.
+        const tipo = req.body?.type || req.query.type || req.query.topic;
+        if (tipo && tipo !== "payment") return res.sendStatus(200);
+
+        const paymentId = req.body?.data?.id || req.query["data.id"] || req.query.id;
 
 
         if (!paymentId) {
 
             return res.sendStatus(200);
+        }
+
+        if (!/^\d+$/.test(String(paymentId))) return res.sendStatus(400);
+        if (!MP_ACCESS_TOKEN || !RESEND_API_KEY || !DOWNLOAD_URL) {
+            console.error("Configure MP_ACCESS_TOKEN, RESEND_API_KEY e DOWNLOAD_URL no Render.");
+            return res.sendStatus(503);
         }
 
 
@@ -257,9 +267,7 @@ app.post("/api/webhook", async (req, res) => {
 
 
         if (
-            emailsEnviados.has(
-                String(payment.id)
-            )
+            emailsEnviados.has(String(payment.id)) || emailsEmAndamento.has(String(payment.id))
         ) {
 
             return res.sendStatus(200);
@@ -272,9 +280,9 @@ app.post("/api/webhook", async (req, res) => {
             );
 
 
-        const email =
-            pedido?.email ||
-            payment.payer?.email;
+        // O e-mail do pagador vem da consulta autenticada ao Mercado Pago.
+        // A memória do pedido só existe até o próximo reinício do servidor.
+        const email = pedido?.email || payment.payer?.email;
 
 
         if (!email) {
@@ -283,15 +291,22 @@ app.post("/api/webhook", async (req, res) => {
                 "Pagamento aprovado, mas e-mail não encontrado."
             );
 
+            return res.sendStatus(503);
+        }
+
+        // Só entrega esta licença para pagamentos gerados pelo checkout do $Zek.
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(payment.external_reference || "")) ||
+            Math.abs(Number(payment.transaction_amount) - ZEK_PRICE) > 0.001) {
+            console.error("Pagamento aprovado não corresponde ao checkout do $Zek:", payment.id);
             return res.sendStatus(200);
         }
 
-
-        const resultado =
-            await resend.emails.send({
+        emailsEmAndamento.add(String(payment.id));
+        try {
+            const resultado = await resend.emails.send({
 
                 from:
-                    "$Zek <onboarding@resend.dev>",
+                    EMAIL_REMETENTE,
 
                 to: email,
 
@@ -319,21 +334,24 @@ app.post("/api/webhook", async (req, res) => {
                         Equipe $Zek
                     </p>
                 `
-            });
+            }, { idempotencyKey: `zek-compra/${payment.id}` });
+
+            if (resultado.error || !resultado.data?.id) {
+                console.error("Falha no Resend:", resultado.error || resultado);
+                return res.sendStatus(503);
+            }
 
 
-        console.log(
-            "Resend:",
-            resultado
-        );
+            console.log("E-mail aceito pelo Resend. Pagamento:", payment.id, "E-mail ID:", resultado.data.id);
 
 
-        emailsEnviados.add(
-            String(payment.id)
-        );
+            emailsEnviados.add(String(payment.id));
 
 
-        res.sendStatus(200);
+            return res.sendStatus(200);
+        } finally {
+            emailsEmAndamento.delete(String(payment.id));
+        }
 
     }
     catch (error) {
